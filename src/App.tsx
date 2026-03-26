@@ -1,0 +1,1111 @@
+import { useState, useEffect, Component, ErrorInfo, ReactNode } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  Twitter, 
+  Send, 
+  Copy, 
+  Check, 
+  Sparkles, 
+  Trash2,
+  Loader2,
+  ArrowRight,
+  Zap,
+  ShieldCheck,
+  TrendingUp,
+  Clock,
+  Users,
+  MessageCircle,
+  Lock,
+  Mail,
+  User as UserIcon,
+  Smartphone,
+  Globe,
+  Flame,
+  LogOut,
+  Github,
+  History,
+  PlusCircle
+} from 'lucide-react';
+import { generateThread, verifyAccessCode, ThreadParams } from './services/gemini';
+import { auth, db, googleProvider } from './lib/firebase';
+import { 
+  signInWithPopup, 
+  onAuthStateChanged, 
+  signOut, 
+  User as FirebaseUser 
+} from 'firebase/auth';
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  collection, 
+  addDoc, 
+  onSnapshot, 
+  query, 
+  where, 
+  orderBy, 
+  serverTimestamp,
+  getDocFromServer
+} from 'firebase/firestore';
+
+// --- Error Handling ---
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string;
+    email?: string | null;
+    emailVerified?: boolean;
+    isAnonymous?: boolean;
+    tenantId?: string | null;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// --- Error Boundary ---
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean, error: any }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#0A0A0B] text-white flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-white/5 border border-white/10 p-10 rounded-[40px] text-center space-y-6">
+            <div className="w-20 h-20 bg-red-500/20 rounded-3xl flex items-center justify-center mx-auto">
+              <Trash2 className="w-10 h-10 text-red-500" />
+            </div>
+            <h2 className="text-2xl font-black uppercase tracking-tight">Terjadi Kesalahan</h2>
+            <p className="text-gray-400 text-sm">Aplikasi mengalami gangguan teknis. Silakan muat ulang halaman.</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-4 bg-white text-black font-black uppercase tracking-widest rounded-2xl"
+            >
+              Muat Ulang
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+type ViewState = 'landing' | 'code' | 'app' | 'history';
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <ThreadGenApp />
+    </ErrorBoundary>
+  );
+}
+
+function ThreadGenApp() {
+  const [view, setView] = useState<ViewState>('landing');
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [userData, setUserData] = useState<any>(null);
+  const [history, setHistory] = useState<any[]>([]);
+  
+  const [hasAccess, setHasAccess] = useState(false);
+  const [accessCode, setAccessCode] = useState('');
+  const [showNotification, setShowNotification] = useState(false);
+  const [notificationMsg, setNotificationMsg] = useState('');
+  
+  const [params, setParams] = useState<ThreadParams>({
+    topic: ''
+  });
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [thread, setThread] = useState<string[]>([]);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [timeLeft, setTimeLeft] = useState(900); // 15 minutes in seconds
+  const [slotsLeft, setSlotsLeft] = useState(3);
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      setUser(firebaseUser);
+      if (firebaseUser) {
+        // Sync user to Firestore
+        const userRef = doc(db, 'users', firebaseUser.uid);
+        try {
+          const userSnap = await getDoc(userRef);
+          if (!userSnap.exists()) {
+            const newUserData = {
+              uid: firebaseUser.uid,
+              email: firebaseUser.email,
+              displayName: firebaseUser.displayName,
+              photoURL: firebaseUser.photoURL,
+              isPro: false,
+              createdAt: serverTimestamp()
+            };
+            await setDoc(userRef, newUserData);
+            setUserData(newUserData);
+          } else {
+            setUserData(userSnap.data());
+            setHasAccess(userSnap.data().isPro);
+          }
+        } catch (err) {
+          handleFirestoreError(err, OperationType.GET, `users/${firebaseUser.uid}`);
+        }
+      } else {
+        setUserData(null);
+        setHasAccess(false);
+      }
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Real-time User Data Sync
+  useEffect(() => {
+    if (user && isAuthReady) {
+      const userRef = doc(db, 'users', user.uid);
+      const unsubscribe = onSnapshot(userRef, (doc) => {
+        if (doc.exists()) {
+          setUserData(doc.data());
+          setHasAccess(doc.data().isPro);
+        }
+      }, (err) => {
+        handleFirestoreError(err, OperationType.GET, `users/${user.uid}`);
+      });
+      return () => unsubscribe();
+    }
+  }, [user, isAuthReady]);
+
+  // Real-time History Sync
+  useEffect(() => {
+    if (user && isAuthReady) {
+      const q = query(
+        collection(db, 'threads'),
+        where('uid', '==', user.uid),
+        orderBy('createdAt', 'desc')
+      );
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const threads = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setHistory(threads);
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'threads');
+      });
+      return () => unsubscribe();
+    }
+  }, [user, isAuthReady]);
+
+  // Test Connection
+  useEffect(() => {
+    async function testConnection() {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if(error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration.");
+        }
+      }
+    }
+    testConnection();
+  }, []);
+
+  useEffect(() => {
+    if (hasAccess && view === 'code') {
+      setView('app');
+    }
+  }, [hasAccess, view]);
+
+  useEffect(() => {
+    if (view === 'landing') {
+      const timer = setInterval(() => {
+        setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0));
+      }, 1000);
+      return () => clearInterval(timer);
+    }
+  }, [view]);
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const handleGenerate = async () => {
+    if (!params.topic || !user) return;
+    setIsGenerating(true);
+    setError(null);
+    try {
+      const result = await generateThread(params);
+      if (result.length === 0) {
+        setError("Gagal meracik thread. Coba ganti topik atau detailnya ya!");
+      } else {
+        setThread(result);
+        // Save to Firestore
+        await addDoc(collection(db, 'threads'), {
+          uid: user.uid,
+          topic: params.topic,
+          content: result,
+          createdAt: serverTimestamp()
+        });
+      }
+    } catch (err: any) {
+      setError(`Error: ${err.message || 'Terjadi kesalahan sistem'}`);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const copyToClipboard = (text: string, index: number) => {
+    navigator.clipboard.writeText(text);
+    setCopiedIndex(index);
+    setTimeout(() => setCopiedIndex(null), 2000);
+  };
+
+  const reset = () => {
+    setParams({ topic: '' });
+    setThread([]);
+    setError(null);
+  };
+
+  const handleGetAccess = async () => {
+    if (!user) {
+      try {
+        await signInWithPopup(auth, googleProvider);
+      } catch (err) {
+        console.error("Login failed:", err);
+      }
+      return;
+    }
+
+    if (hasAccess) {
+      setView('app');
+    } else {
+      setView('code');
+    }
+  };
+
+  const handleVerifyCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    try {
+      const valid = await verifyAccessCode(accessCode);
+      if (valid) {
+        // Update Firestore
+        const userRef = doc(db, 'users', user.uid);
+        await setDoc(userRef, { isPro: true }, { merge: true });
+        
+        setHasAccess(true);
+        setView('app');
+        setNotificationMsg("Akses Diberikan! Selamat datang.");
+        setShowNotification(true);
+        setTimeout(() => setShowNotification(false), 3000);
+      } else {
+        alert("Kode akses salah! Silakan dapatkan kode yang valid.");
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setView('landing');
+    } catch (err) {
+      console.error("Logout failed:", err);
+    }
+  };
+
+  if (view === 'landing') {
+    return (
+      <div className="min-h-screen bg-[#0A0A0B] text-white font-sans overflow-x-hidden selection:bg-[#1DA1F2]/30">
+        {/* Background Glow */}
+        <div className="fixed top-0 left-0 w-full h-full overflow-hidden pointer-events-none z-0">
+          <div className="absolute top-[-10%] left-[-10%] w-[60%] h-[60%] bg-[#1DA1F2]/5 blur-[120px] rounded-full" />
+          <div className="absolute bottom-[-10%] right-[-10%] w-[60%] h-[60%] bg-purple-500/5 blur-[120px] rounded-full" />
+        </div>
+
+        {/* Navigation */}
+        <nav className="relative z-50 max-w-7xl mx-auto px-6 h-24 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-[#1DA1F2] p-2 rounded-xl">
+              <Twitter className="text-white w-6 h-6" />
+            </div>
+            <span className="text-xl font-black tracking-tighter uppercase">ThreadGen<span className="text-[#1DA1F2]">Pro</span></span>
+          </div>
+            <div className="flex items-center gap-6">
+              {user ? (
+                <div className="flex items-center gap-4">
+                  <img src={user.photoURL || ''} className="w-10 h-10 rounded-full border border-white/20" referrerPolicy="no-referrer" />
+                  <button 
+                    onClick={handleGetAccess}
+                    className="px-6 py-2.5 bg-white/5 border border-white/10 rounded-xl text-sm font-bold hover:bg-white/10 transition-all"
+                  >
+                    {hasAccess ? 'Dashboard' : 'Aktivasi'}
+                  </button>
+                </div>
+              ) : (
+                <button 
+                  onClick={handleGetAccess}
+                  className="px-6 py-2.5 bg-[#1DA1F2] rounded-xl text-sm font-bold hover:bg-[#1DA1F2]/80 transition-all"
+                >
+                  Login with Google
+                </button>
+              )}
+            </div>
+        </nav>
+
+        <main className="relative z-10">
+          {/* Hero Section */}
+          <section className="max-w-7xl mx-auto px-6 pt-20 pb-32 text-center">
+            <motion.div 
+              initial={{ y: -20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-[#1DA1F2]/10 border border-[#1DA1F2]/20 rounded-full text-[#1DA1F2] text-xs font-black uppercase tracking-widest mb-8"
+            >
+              <Sparkles className="w-3 h-3" />
+              X & THREADS VIRAL ENGINE v2.5
+            </motion.div>
+            
+            <motion.h1 
+              initial={{ y: 20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ delay: 0.1 }}
+              className="text-6xl md:text-8xl font-black tracking-tighter leading-[0.9] mb-8"
+            >
+              DOMINASI <span className="text-[#1DA1F2]">X</span> & <span className="text-purple-500">THREADS</span><br />TANPA KERJA KERAS.
+            </motion.h1>
+            
+            <motion.p 
+              initial={{ y: 20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ delay: 0.2 }}
+              className="text-gray-400 text-xl md:text-2xl max-w-3xl mx-auto leading-relaxed mb-12"
+            >
+              Berhenti membuang waktu berjam-jam hanya untuk satu thread. Gunakan mesin viral kami yang menghasilkan konten "Anti-AI" yang dioptimalkan untuk X dan Threads dalam hitungan detik.
+            </motion.p>
+
+            <motion.div 
+              initial={{ y: 20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ delay: 0.3 }}
+              className="flex flex-col items-center gap-6"
+            >
+                <button 
+                  onClick={handleGetAccess}
+                  className="group relative px-10 py-5 bg-[#1DA1F2] text-white font-black uppercase tracking-widest rounded-2xl text-lg hover:scale-105 transition-all flex items-center gap-3 shadow-[0_0_50px_rgba(29,161,242,0.4)]"
+                >
+                  {!user ? 'LOGIN & MULAI' : hasAccess ? 'MASUK KE DASHBOARD' : 'AMBIL AKSES SEKARANG'}
+                  <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                </button>
+              <div className="flex items-center gap-4 text-gray-500 text-sm font-medium">
+                <div className="flex -space-x-2">
+                  {[1,2,3,4].map(i => (
+                    <img key={i} src={`https://i.pravatar.cc/100?u=${i}`} className="w-8 h-8 rounded-full border-2 border-[#0A0A0B]" referrerPolicy="no-referrer" />
+                  ))}
+                </div>
+                <span>Bergabung dengan 5,200+ Creators</span>
+              </div>
+            </motion.div>
+          </section>
+
+          {/* Detailed Features Section */}
+          <section className="py-32 bg-white/[0.01]">
+            <div className="max-w-7xl mx-auto px-6">
+              <div className="text-center mb-20">
+                <h2 className="text-4xl md:text-5xl font-black mb-6">FITUR UNGGULAN KAMI</h2>
+                <p className="text-gray-400 text-lg max-w-2xl mx-auto">Dirancang khusus untuk kamu yang ingin membangun personal brand kuat di media sosial.</p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+                {[
+                  { icon: Globe, title: "Multi-Platform", desc: "Satu kali generate, konten langsung siap untuk X dan Threads sekaligus." },
+                  { icon: ShieldCheck, title: "100% Anti-AI", desc: "Gaya bahasa sangat manusiawi, menggunakan slang yang tepat, dan emosional." },
+                  { icon: Flame, title: "Viral Hook Engine", desc: "Dapatkan hook yang menghentak untuk memastikan orang berhenti scroll." },
+                  { icon: TrendingUp, title: "Growth Analytics", desc: "Struktur thread yang didesain untuk memaksimalkan retweet dan share." },
+                  { icon: Smartphone, title: "Mobile Optimized", desc: "Tampilan dashboard yang sangat responsif, kerja dari mana saja." },
+                  { icon: Lock, title: "Secure Access", desc: "Sistem login aman dengan kode akses eksklusif untuk setiap member." },
+                  { icon: MessageCircle, title: "Priority Support", desc: "Butuh bantuan? Tim kami siap membantu langsung via Dashboard." },
+                  { icon: Zap, title: "Instant Result", desc: "Tidak perlu menunggu lama, hasil keluar dalam hitungan detik." }
+                ].map((feature, i) => (
+                  <div key={i} className="bg-white/5 border border-white/10 p-8 rounded-[32px] hover:bg-white/10 transition-all group">
+                    <div className="w-12 h-12 bg-[#1DA1F2]/10 rounded-2xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
+                      <feature.icon className="w-6 h-6 text-[#1DA1F2]" />
+                    </div>
+                    <h3 className="text-xl font-bold mb-3">{feature.title}</h3>
+                    <p className="text-gray-400 text-sm leading-relaxed">{feature.desc}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+
+          {/* Problem Section */}
+          <section className="bg-white/[0.02] py-32 border-y border-white/5">
+            <div className="max-w-7xl mx-auto px-6 grid grid-cols-1 md:grid-cols-2 gap-20 items-center">
+              <div className="space-y-8">
+                <h2 className="text-4xl md:text-5xl font-black leading-tight">
+                  KENAPA THREAD KAMU <span className="text-red-500">GAK PERNAH</span> VIRAL?
+                </h2>
+                <div className="space-y-6">
+                  {[
+                    "Hook yang membosankan & gak bikin orang berhenti scroll.",
+                    "Struktur berantakan yang bikin pembaca pusing.",
+                    "Bahasa kaku kayak robot (AI banget).",
+                    "Gak tahu cara 'soft sell' produk yang bener."
+                  ].map((text, i) => (
+                    <div key={i} className="flex items-start gap-4">
+                      <div className="mt-1.5 w-5 h-5 bg-red-500/20 rounded-full flex items-center justify-center flex-shrink-0">
+                        <div className="w-2 h-2 bg-red-500 rounded-full" />
+                      </div>
+                      <p className="text-gray-400 text-lg">{text}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="relative">
+                <div className="absolute inset-0 bg-[#1DA1F2]/20 blur-[100px] rounded-full" />
+                <div className="relative bg-white/5 border border-white/10 p-8 rounded-[40px] backdrop-blur-xl">
+                  <div className="space-y-4">
+                    <div className="h-4 bg-white/10 rounded-full w-3/4" />
+                    <div className="h-4 bg-white/10 rounded-full w-full" />
+                    <div className="h-4 bg-white/10 rounded-full w-2/3" />
+                    <div className="pt-8 space-y-4">
+                      <div className="h-20 bg-red-500/10 border border-red-500/20 rounded-2xl flex items-center justify-center text-red-400 font-bold italic">
+                        "Thread ini membosankan..."
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Solution / How it Works */}
+          <section className="py-32">
+            <div className="max-w-7xl mx-auto px-6">
+              <div className="text-center mb-20 space-y-4">
+                <h2 className="text-4xl md:text-6xl font-black">3 LANGKAH MENUJU VIRAL</h2>
+                <p className="text-gray-400 text-xl">Proses yang sangat simpel, hasil yang sangat brutal.</p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-12">
+                {[
+                  { step: "01", title: "Input Ide", desc: "Masukkan topik atau poin-poin kasar yang ada di kepala kamu." },
+                  { step: "02", title: "AI Magic", desc: "Mesin kami meracik hook, storytelling, dan struktur viral." },
+                  { step: "03", title: "Copy & Viral", desc: "Salin hasilnya, posting, dan lihat engagement kamu meledak." }
+                ].map((item, i) => (
+                  <div key={i} className="relative group">
+                    <div className="text-8xl font-black text-white/5 absolute -top-10 -left-4 group-hover:text-[#1DA1F2]/10 transition-colors">{item.step}</div>
+                    <div className="relative space-y-4">
+                      <h3 className="text-2xl font-bold">{item.title}</h3>
+                      <p className="text-gray-400 leading-relaxed">{item.desc}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+
+          {/* Testimonials Section */}
+          <section className="py-32 bg-white/[0.01]">
+            <div className="max-w-7xl mx-auto px-6">
+              <div className="text-center mb-20">
+                <h2 className="text-4xl md:text-5xl font-black mb-6">APA KATA MEREKA?</h2>
+                <p className="text-gray-400 text-lg max-w-2xl mx-auto italic">"Beneran anti-AI, gak kaku, dan hasilnya gila parah."</p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                {[
+                  { 
+                    name: "@BudiKreator", 
+                    text: "Jujurly, awalnya ragu. Tapi pas nyoba... gila sih. Hook-nya beneran nendang. Thread pertama gue langsung dapet 500+ retweet. Worth it parah cuma 99rb sekali bayar.",
+                    avatar: "https://i.pravatar.cc/150?u=budi"
+                  },
+                  { 
+                    name: "@SiskaDigital", 
+                    text: "Gak nyangka AI bisa nulis se-manusia ini. Gak kaku sama sekali. Sangat membantu buat gue yang sibuk tapi pengen tetep eksis di X & Threads tanpa pusing mikir.",
+                    avatar: "https://i.pravatar.cc/150?u=siska"
+                  },
+                  { 
+                    name: "@AndiTech", 
+                    text: "Investasi terbaik tahun ini. Cuma sekali bayar, dapet mesin viral. Gak perlu pusing mikir konten lagi tiap pagi. Langsung copy-paste, engagement meledak!",
+                    avatar: "https://i.pravatar.cc/150?u=andi"
+                  }
+                ].map((testi, i) => (
+                  <motion.div 
+                    key={i} 
+                    whileHover={{ y: -10 }}
+                    className="bg-white/5 border border-white/10 p-8 rounded-[32px] space-y-6 relative overflow-hidden group"
+                  >
+                    <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                      <Twitter className="w-12 h-12" />
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <img src={testi.avatar} className="w-12 h-12 rounded-full border-2 border-[#1DA1F2]" referrerPolicy="no-referrer" />
+                      <div>
+                        <p className="font-bold">{testi.name}</p>
+                        <p className="text-xs text-gray-500">Verified Member</p>
+                      </div>
+                    </div>
+                    <p className="text-gray-300 leading-relaxed italic">"{testi.text}"</p>
+                  </motion.div>
+                ))}
+              </div>
+            </div>
+          </section>
+
+          {/* Radical Scarcity Offer */}
+          <section className="max-w-5xl mx-auto px-6 py-20">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              whileInView={{ scale: 1, opacity: 1 }}
+              viewport={{ once: true }}
+              className="bg-gradient-to-br from-[#1DA1F2] to-blue-900 rounded-[64px] p-12 md:p-24 text-center relative overflow-hidden shadow-[0_0_120px_rgba(29,161,242,0.4)] border-8 border-white/10"
+            >
+              <div className="absolute top-0 right-0 w-96 h-96 bg-white/10 blur-[120px] rounded-full -translate-y-1/2 translate-x-1/2" />
+              <div className="absolute bottom-0 left-0 w-96 h-96 bg-black/30 blur-[120px] rounded-full translate-y-1/2 -translate-x-1/2" />
+              
+              <div className="relative z-10 flex flex-col items-center space-y-10">
+                <motion.div 
+                  animate={{ scale: [1, 1.1, 1] }}
+                  transition={{ repeat: Infinity, duration: 2 }}
+                  className="inline-flex items-center gap-2 px-8 py-3 bg-red-600 text-white font-black uppercase tracking-[0.2em] rounded-full text-sm shadow-xl"
+                >
+                  <Flame className="w-5 h-5" /> PERINGATAN: SISA {slotsLeft} SLOT TERAKHIR!
+                </motion.div>
+                
+                <h2 className="text-5xl md:text-8xl font-black leading-[0.85] tracking-tighter">
+                  AMANKAN HARGA <br /><span className="text-yellow-400">PROMO 99RB</span> <br />SEKARANG JUGA!
+                </h2>
+                
+                <div className="flex flex-col items-center gap-2">
+                  <p className="text-white/40 text-3xl font-bold line-through tracking-tighter">Rp 299.000</p>
+                  <div className="flex items-center gap-6">
+                    <p className="text-7xl md:text-9xl font-black text-white drop-shadow-2xl">Rp 99rb</p>
+                    <motion.div 
+                      animate={{ rotate: [12, 15, 12] }}
+                      transition={{ repeat: Infinity, duration: 1 }}
+                      className="bg-yellow-400 text-black px-6 py-2 rounded-2xl font-black text-2xl shadow-2xl"
+                    >
+                      SAVE 67%
+                    </motion.div>
+                  </div>
+                </div>
+
+                <p className="text-white/90 text-2xl max-w-3xl mx-auto font-bold leading-relaxed">
+                  Jangan sampai menyesal. Besok harga <span className="text-red-400 underline decoration-4 underline-offset-8">NAIK 3X LIPAT</span>. Ini adalah kesempatan terakhir kamu untuk akses seumur hidup.
+                </p>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-10 w-full max-w-3xl">
+                  <div className="bg-black/20 backdrop-blur-xl p-8 rounded-[40px] border border-white/10 shadow-inner">
+                    <p className="text-white/50 text-xs font-black uppercase tracking-[0.3em] mb-4">Slot Hampir Habis</p>
+                    <div className="flex items-end justify-center gap-3">
+                      <p className="text-7xl font-black text-yellow-400 tabular-nums">{slotsLeft}</p>
+                      <p className="text-2xl font-bold text-white/30 mb-2">/ 100</p>
+                    </div>
+                    <div className="mt-6 h-4 bg-white/10 rounded-full overflow-hidden p-1">
+                      <motion.div 
+                        initial={{ width: "0%" }}
+                        animate={{ width: `${(slotsLeft / 100) * 100}%` }}
+                        className="h-full bg-gradient-to-r from-yellow-400 to-orange-500 rounded-full shadow-[0_0_20px_rgba(250,204,21,0.5)]"
+                      />
+                    </div>
+                  </div>
+                  
+                  <div className="bg-black/20 backdrop-blur-xl p-8 rounded-[40px] border border-white/10 shadow-inner">
+                    <p className="text-white/50 text-xs font-black uppercase tracking-[0.3em] mb-4">Promo Berakhir Dalam</p>
+                    <p className="text-7xl font-black font-mono text-white tabular-nums tracking-tighter">{formatTime(timeLeft)}</p>
+                    <p className="mt-6 text-[10px] font-black text-red-400 uppercase tracking-[0.5em] animate-pulse">Waktu Hampir Habis!</p>
+                  </div>
+                </div>
+
+                <div className="pt-12 w-full max-w-2xl">
+                  <motion.button 
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.95 }}
+                    onClick={handleGetAccess}
+                    className="group w-full px-12 py-10 bg-white text-[#1DA1F2] font-black uppercase tracking-[0.2em] rounded-[40px] text-3xl shadow-[0_30px_100px_rgba(255,255,255,0.4)] flex flex-col items-center gap-2"
+                  >
+                    <span>{hasAccess ? 'MASUK KE DASHBOARD' : 'SAYA MAU AKSES PRO SEKARANG!'}</span>
+                    <span className="text-sm font-bold opacity-50 tracking-normal normal-case">Klik untuk masukkan kode akses atau beli baru</span>
+                  </motion.button>
+                </div>
+
+                <div className="flex flex-wrap justify-center gap-10 pt-12 opacity-50">
+                  <div className="flex items-center gap-3 text-sm font-black tracking-widest">
+                    <ShieldCheck className="w-5 h-5" /> SECURE CHECKOUT
+                  </div>
+                  <div className="flex items-center gap-3 text-sm font-black tracking-widest">
+                    <Zap className="w-5 h-5" /> INSTANT ACTIVATION
+                  </div>
+                  <div className="flex items-center gap-3 text-sm font-black tracking-widest">
+                    <Users className="w-5 h-5" /> 5,200+ MEMBERS
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </section>
+
+          {/* FAQ Section */}
+          <section className="max-w-3xl mx-auto px-6 py-32">
+            <h2 className="text-3xl font-black text-center mb-16">PERTANYAAN YANG SERING DIAJUKAN</h2>
+            <div className="space-y-6">
+              {[
+                { q: "Apakah hasilnya beneran gak kayak AI?", a: "Ya! Algoritma kami dirancang khusus untuk meniru gaya bahasa manusia Indonesia yang santai dan relatable." },
+                { q: "Bisa buat topik apa aja?", a: "Apapun. Mulai dari tech, finansial, curhat, sampai jualan produk affiliate." },
+                { q: "Apakah aman buat akun X & Threads saya?", a: "Sangat aman. Kami hanya membantu meracik konten, kamu tetap yang memposting secara manual." },
+                { q: "Bagaimana cara mendapatkan kode akses?", a: "Setelah mendaftar, kamu bisa langsung mencoba fitur generator kami secara gratis atau upgrade ke PRO untuk fitur tak terbatas." }
+              ].map((faq, i) => (
+                <div key={i} className="bg-white/5 border border-white/10 p-8 rounded-3xl space-y-4">
+                  <h4 className="text-lg font-bold flex items-center gap-3">
+                    <div className="w-2 h-2 bg-[#1DA1F2] rounded-full" />
+                    {faq.q}
+                  </h4>
+                  <p className="text-gray-400 leading-relaxed">{faq.a}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {/* Final CTA */}
+          <section className="py-32 text-center border-t border-white/5">
+            <h2 className="text-4xl md:text-6xl font-black mb-12">SIAP JADI RAJA <span className="text-[#1DA1F2]">X</span> & <span className="text-purple-500">THREADS</span>?</h2>
+            <button 
+              onClick={handleGetAccess}
+              className="px-12 py-6 bg-white text-black font-black uppercase tracking-widest rounded-2xl text-xl hover:bg-gray-200 transition-all"
+            >
+              {hasAccess ? 'MASUK KE DASHBOARD' : 'AMBIL AKSES SEKARANG'}
+            </button>
+          </section>
+        </main>
+
+        <footer className="max-w-7xl mx-auto px-6 py-20 text-center space-y-4 opacity-50">
+          <p className="text-sm font-bold">© 2026 ThreadGenPro. All Rights Reserved.</p>
+          <div className="flex flex-col items-center gap-2">
+            <p className="text-[10px] font-black uppercase tracking-[0.5em]">Dibuat dengan ❤️ Ryant Kaya Raya</p>
+            <a 
+              href="https://github.com/ryantrega99" 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 text-[10px] font-black uppercase tracking-widest hover:text-white transition-colors"
+            >
+              <Github className="w-3 h-3" /> GITHUB REPOSITORY
+            </a>
+          </div>
+        </footer>
+      </div>
+    );
+  }
+
+  if (view === 'code') {
+    return (
+      <div className="min-h-screen bg-[#0A0A0B] text-white flex items-center justify-center p-6 relative overflow-hidden">
+        {/* Background Glow */}
+        <div className="fixed top-0 left-0 w-full h-full overflow-hidden pointer-events-none z-0">
+          <div className="absolute top-[-10%] left-[-10%] w-[60%] h-[60%] bg-[#1DA1F2]/5 blur-[120px] rounded-full" />
+          <div className="absolute bottom-[-10%] right-[-10%] w-[60%] h-[60%] bg-purple-500/5 blur-[120px] rounded-full" />
+        </div>
+
+        <AnimatePresence>
+          {showNotification && (
+            <motion.div 
+              initial={{ y: -100, opacity: 0 }}
+              animate={{ y: 20, opacity: 1 }}
+              exit={{ y: -100, opacity: 0 }}
+              className="fixed top-0 left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm"
+            >
+              <div className="bg-amber-500 p-6 rounded-3xl shadow-2xl border border-white/20 flex items-center gap-4">
+                <div className="bg-white/20 p-3 rounded-2xl">
+                  <Sparkles className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                  <p className="font-black uppercase tracking-widest text-xs text-white">Sistem Notifikasi</p>
+                  <p className="text-sm font-bold text-white">{notificationMsg}</p>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="w-full max-w-md bg-white/5 border border-white/10 p-10 rounded-[40px] backdrop-blur-xl space-y-8 relative z-10"
+        >
+          <div className="text-center space-y-2">
+            <div className="w-16 h-16 bg-amber-500 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg shadow-amber-500/20">
+              <Lock className="w-8 h-8 text-white" />
+            </div>
+            <h2 className="text-3xl font-black uppercase tracking-tighter">Aktivasi Akses</h2>
+            <p className="text-gray-400">Masukkan kode akses untuk mulai menggunakan ThreadGenPro</p>
+          </div>
+
+          <form onSubmit={handleVerifyCode} className="space-y-6">
+            <input 
+              type="text" 
+              required
+              placeholder="KODE-AKSES-ANDA"
+              className="w-full px-4 py-6 bg-white/5 border border-white/10 rounded-2xl focus:border-amber-500 outline-none transition-all font-black text-center text-2xl tracking-[0.3em] uppercase placeholder:tracking-normal placeholder:font-medium placeholder:text-lg"
+              value={accessCode}
+              onChange={(e) => setAccessCode(e.target.value)}
+            />
+
+            <button 
+              type="submit"
+              className="w-full py-4 bg-amber-500 text-white font-black uppercase tracking-widest rounded-2xl hover:scale-[1.02] transition-all shadow-lg shadow-amber-500/20"
+            >
+              Aktivasi Sekarang
+            </button>
+          </form>
+
+          <div className="bg-amber-500/10 border border-amber-500/20 p-6 rounded-3xl space-y-4">
+            <div className="space-y-1">
+              <p className="text-xs font-black uppercase tracking-widest text-amber-500">Belum punya kode?</p>
+              <p className="text-sm text-gray-400 leading-relaxed">
+                Dapatkan kode akses eksklusif kamu melalui website resmi kami di bawah ini:
+              </p>
+            </div>
+            <a 
+              href="https://larisdigi.myscalev.com/threads-gen"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-3 bg-white/10 hover:bg-white/20 text-white text-sm font-bold rounded-xl flex items-center justify-center gap-2 transition-all border border-white/10"
+            >
+              Dapatkan Kode Akses <ArrowRight className="w-4 h-4" />
+            </a>
+          </div>
+
+          <button 
+            onClick={() => setView('landing')}
+            className="w-full text-center text-xs text-gray-600 hover:text-gray-400"
+          >
+            Kembali ke Beranda
+          </button>
+        </motion.div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans selection:bg-[#1DA1F2]/10">
+      {/* Header */}
+      <header className="bg-white/80 backdrop-blur-md border-b border-gray-200 sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+          <div className="flex items-center gap-3 cursor-pointer" onClick={() => setView('landing')}>
+            <div className="bg-[#1DA1F2] p-2.5 rounded-xl shadow-lg shadow-blue-100">
+              <Twitter className="text-white w-6 h-6" />
+            </div>
+            <span className="text-xl font-black tracking-tighter uppercase">ThreadGen<span className="text-[#1DA1F2]">Pro</span></span>
+          </div>
+            <div className="flex items-center gap-4">
+              <button 
+                onClick={() => setView(view === 'history' ? 'app' : 'history')}
+                className={`p-2.5 rounded-xl transition-all flex items-center gap-2 ${view === 'history' ? 'bg-[#1DA1F2] text-white' : 'text-gray-400 hover:bg-gray-100'}`}
+                title="History"
+              >
+                <History className="w-5 h-5" />
+                {view === 'history' && <span className="text-xs font-bold uppercase tracking-widest">Back</span>}
+              </button>
+              <div className="flex flex-col items-end mr-4">
+                <span className="text-xs font-black text-gray-400 uppercase tracking-widest">Status</span>
+                <span className={`text-sm font-bold ${hasAccess ? 'text-[#1DA1F2]' : 'text-amber-500'}`}>
+                  {hasAccess ? 'PRO MEMBER' : 'FREE USER'}
+                </span>
+              </div>
+              <button 
+                onClick={handleLogout}
+                className="p-2.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+                title="Logout"
+              >
+                <LogOut className="w-5 h-5" />
+              </button>
+            <button 
+              onClick={reset}
+              className="p-2.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+              title="Reset All"
+            >
+              <Trash2 className="w-5 h-5" />
+            </button>
+            <div className="h-8 w-[1px] bg-gray-200 mx-2" />
+            <div className="flex items-center gap-2 bg-gray-100 px-4 py-2 rounded-full">
+              <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+              <span className="text-xs font-bold text-gray-500 uppercase tracking-widest">System Online</span>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-6 py-12">
+        {view === 'history' ? (
+          <div className="space-y-8">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-purple-50 rounded-xl flex items-center justify-center">
+                  <History className="w-5 h-5 text-purple-500" />
+                </div>
+                <h2 className="text-2xl font-black uppercase tracking-tight">Riwayat Thread</h2>
+              </div>
+              <button 
+                onClick={() => setView('app')}
+                className="flex items-center gap-2 px-6 py-3 bg-[#1DA1F2] text-white font-bold rounded-2xl hover:scale-105 transition-all"
+              >
+                <PlusCircle className="w-5 h-5" />
+                Buat Baru
+              </button>
+            </div>
+
+            {history.length === 0 ? (
+              <div className="bg-white p-20 rounded-[40px] border-4 border-dashed border-gray-100 flex flex-col items-center justify-center text-center space-y-6">
+                <div className="w-20 h-20 bg-gray-50 rounded-[32px] flex items-center justify-center">
+                  <Clock className="w-10 h-10 text-gray-200" />
+                </div>
+                <div className="space-y-2">
+                  <p className="text-xl font-bold text-gray-400">Belum ada riwayat</p>
+                  <p className="text-gray-300 font-medium">Thread yang kamu buat akan muncul di sini.</p>
+                </div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {history.map((item) => (
+                  <div 
+                    key={item.id} 
+                    className="bg-white p-8 rounded-[32px] border border-gray-100 hover:border-[#1DA1F2]/30 transition-all cursor-pointer group"
+                    onClick={() => {
+                      setParams({ topic: item.topic });
+                      setThread(item.content);
+                      setView('app');
+                    }}
+                  >
+                    <div className="flex justify-between items-start mb-4">
+                      <div className="text-[10px] font-black uppercase tracking-widest text-gray-400">
+                        {item.createdAt?.toDate().toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      </div>
+                      <ArrowRight className="w-4 h-4 text-gray-300 group-hover:text-[#1DA1F2] group-hover:translate-x-1 transition-all" />
+                    </div>
+                    <h3 className="text-lg font-bold mb-2 line-clamp-2">{item.topic}</h3>
+                    <p className="text-sm text-gray-400">{item.content.length} Tweets</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
+            {/* Sidebar / Form */}
+            <aside className="lg:col-span-5 space-y-8">
+              <div className="bg-white p-8 rounded-[32px] shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-gray-100">
+                <div className="flex items-center gap-3 mb-8">
+                  <div className="w-10 h-10 bg-amber-50 rounded-xl flex items-center justify-center">
+                    <Sparkles className="w-5 h-5 text-amber-500" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-bold">Konfigurasi Konten</h2>
+                    <p className="text-sm text-gray-400">Optimalkan untuk X & Threads</p>
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  <div className="space-y-2">
+                    <label className="text-[11px] font-black uppercase tracking-[0.2em] text-gray-400 ml-1">Topik Utama</label>
+                    <textarea 
+                      placeholder="Apa yang ingin kamu bahas hari ini?"
+                      className="w-full p-4 bg-gray-50 border-2 border-transparent focus:border-[#1DA1F2] focus:bg-white rounded-2xl transition-all min-h-[200px] resize-none outline-none font-medium placeholder:text-gray-300"
+                      value={params.topic}
+                      onChange={(e) => setParams({...params, topic: e.target.value})}
+                    />
+                  </div>
+
+                  <button 
+                    onClick={handleGenerate}
+                    disabled={isGenerating || !params.topic}
+                    className="w-full py-5 bg-[#1DA1F2] text-white font-black uppercase tracking-widest rounded-2xl shadow-[0_20px_40px_rgba(29,161,242,0.2)] hover:shadow-[0_20px_40px_rgba(29,161,242,0.4)] hover:scale-[1.02] active:scale-[0.98] transition-all disabled:opacity-50 disabled:scale-100 disabled:shadow-none flex items-center justify-center gap-3"
+                  >
+                    {isGenerating ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Processing...
+                      </>
+                    ) : (
+                      <>
+                        <Zap className="w-5 h-5 fill-current" />
+                        Generate Thread
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </aside>
+
+            {/* Main Content / Preview */}
+            <section className="lg:col-span-7 space-y-8">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center">
+                    <Twitter className="w-5 h-5 text-[#1DA1F2]" />
+                  </div>
+                  <h2 className="text-xl font-bold">Preview Utas (X & Threads)</h2>
+                </div>
+                {thread.length > 0 && (
+                  <button 
+                    onClick={() => {
+                      const allText = thread.join('\n\n---\n\n');
+                      navigator.clipboard.writeText(allText);
+                    }}
+                    className="text-xs font-black uppercase tracking-widest text-[#1DA1F2] hover:bg-blue-50 px-4 py-2 rounded-lg transition-all"
+                  >
+                    Copy All
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-6 relative">
+                <AnimatePresence mode="popLayout">
+                  {error && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="bg-red-50 border-2 border-red-100 p-6 rounded-3xl text-red-600 font-bold flex items-center gap-4"
+                    >
+                      <div className="bg-red-100 p-2 rounded-xl">
+                        <Trash2 className="w-5 h-5" />
+                      </div>
+                      {error}
+                    </motion.div>
+                  )}
+
+                  {thread.length === 0 && !isGenerating && !error && (
+                    <motion.div 
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className="bg-white p-20 rounded-[40px] border-4 border-dashed border-gray-100 flex flex-col items-center justify-center text-center space-y-6"
+                    >
+                      <div className="w-20 h-20 bg-gray-50 rounded-[32px] flex items-center justify-center">
+                        <Twitter className="w-10 h-10 text-gray-200" />
+                      </div>
+                      <div className="space-y-2">
+                        <p className="text-xl font-bold text-gray-400">Siap Viral?</p>
+                        <p className="text-gray-300 font-medium">Isi detail di samping dan biarkan keajaiban terjadi.</p>
+                      </div>
+                    </motion.div>
+                  )}
+
+                  {isGenerating && (
+                    <div className="space-y-6">
+                      {[1, 2, 3].map((i) => (
+                        <div key={i} className="bg-white p-8 rounded-[32px] border border-gray-100 animate-pulse">
+                          <div className="h-4 bg-gray-50 rounded-full w-3/4 mb-4"></div>
+                          <div className="h-4 bg-gray-50 rounded-full w-1/2"></div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {thread.map((tweet, index) => (
+                    <motion.div 
+                      key={index}
+                      initial={{ opacity: 0, scale: 0.95 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      transition={{ delay: index * 0.05 }}
+                      className="bg-white p-8 rounded-[32px] shadow-[0_4px_20px_rgb(0,0,0,0.02)] border border-gray-100 group relative hover:border-[#1DA1F2]/30 transition-all"
+                    >
+                      <div className="absolute top-6 right-6 opacity-0 group-hover:opacity-100 transition-all scale-90 group-hover:scale-100">
+                        <button 
+                          onClick={() => copyToClipboard(tweet, index)}
+                          className="p-3 bg-gray-50 hover:bg-[#1DA1F2] hover:text-white rounded-2xl transition-all"
+                        >
+                          {copiedIndex === index ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                        </button>
+                      </div>
+                      
+                      <div className="flex gap-6">
+                        <div className="flex flex-col items-center gap-3">
+                          <div className="w-12 h-12 bg-gray-50 rounded-2xl flex items-center justify-center font-black text-gray-300 text-lg">
+                            {index + 1}
+                          </div>
+                          {index < thread.length - 1 && (
+                            <div className="w-[2px] flex-1 bg-gradient-to-b from-gray-100 to-transparent rounded-full"></div>
+                          )}
+                        </div>
+                        <div className="flex-1 pt-2">
+                          <p className="whitespace-pre-wrap text-[17px] leading-[1.6] text-gray-700 font-medium">
+                            {tweet}
+                          </p>
+                          <div className="mt-6 flex items-center gap-4">
+                            <div className={`h-1 flex-1 rounded-full bg-gray-100 overflow-hidden`}>
+                              <div 
+                                className={`h-full transition-all duration-500 ${tweet.length > 260 ? 'bg-red-400' : 'bg-[#1DA1F2]'}`}
+                                style={{ width: `${Math.min((tweet.length / 280) * 100, 100)}%` }}
+                              />
+                            </div>
+                            <span className={`text-[10px] font-black uppercase tracking-widest ${tweet.length > 260 ? 'text-red-400' : 'text-gray-300'}`}>
+                              {tweet.length} / 280
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+            </section>
+          </div>
+        )}
+      </main>
+
+      <footer className="max-w-7xl mx-auto px-6 py-20 border-t border-gray-100 text-center space-y-4">
+        <div className="flex items-center justify-center gap-2 text-gray-400 font-bold">
+          <span>Dibuat dengan</span>
+          <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ repeat: Infinity, duration: 2 }}>
+            ❤️
+          </motion.div>
+          <span>Ryant Kaya Raya</span>
+        </div>
+        <p className="text-[11px] font-black uppercase tracking-[0.3em] text-gray-300">Powered by UD KAYA RAYA</p>
+      </footer>
+    </div>
+  );
+}

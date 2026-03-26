@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and subscription status",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "isPro": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "isPro"]
+    },
+    "Thread": {
+      "title": "Thread",
+      "description": "A generated Twitter/X thread",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Author UID" },
+        "topic": { "type": "string" },
+        "content": { 
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "topic", "content", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/threads/{threadId}": {
+      "schema": "Thread",
+      "description": "Generated threads"
+    }
+  }
+}
